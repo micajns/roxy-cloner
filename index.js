@@ -1,40 +1,249 @@
 require('dotenv').config();
-const { Client } = require('discord.js-selfbot-v13');
-const https = require('https');
 
-const colors = {
-    red: '\x1b[31m',
-    green: '\x1b[32m',
-    yellow: '\x1b[33m',
-    blue: '\x1b[34m',
-    magenta: '\x1b[35m',
-    cyan: '\x1b[36m',
-    white: '\x1b[37m',
-    reset: '\x1b[0m'
-};
+const {
+    Client,
+    GatewayIntentBits,
+    ChannelType,
+    PermissionsBitField
+} = require('discord.js');
 
-const log = {
-    success: (msg) => console.log(`${colors.green}[+] ${msg}${colors.reset}`),
-    error: (msg) => console.log(`${colors.red}[-] ${msg}${colors.reset}`),
-    warning: (msg) => console.log(`${colors.yellow}[!] ${msg}${colors.reset}`),
-    info: (msg) => console.log(`${colors.cyan}[i] ${msg}${colors.reset}`),
-    header: (msg) => console.log(`${colors.magenta}${msg}${colors.reset}`)
-};
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMembers,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent
+    ]
+});
 
+const allowedUsers = (process.env.ALLOWED_USER_IDS || '')
+    .split(',')
+    .map(id => id.trim())
+    .filter(Boolean);
 
-const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+const pending = new Map();
 
-async function downloadImage(url) {
-    return new Promise((resolve, reject) => {
-        https.get(url, (res) => {
-            const chunks = [];
-            res.on('data', chunk => chunks.push(chunk));
-            res.on('end', () => {
-                const buffer = Buffer.concat(chunks);
-                const base64 = buffer.toString('base64');
-                const mimeType = res.headers['content-type'] || 'image/png';
-                resolve(`data:${mimeType};base64,${base64}`);
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+function allowed(id) {
+    return allowedUsers.includes(id);
+}
+
+async function cloneServer(source, target, channel) {
+    await channel.send(`🗑️ Cleaning **${target.name}**...`);
+
+    const channels = [...target.channels.cache.values()]
+        .filter(c => c.deletable);
+
+    for (const ch of channels) {
+        try {
+            await ch.delete();
+            await sleep(150);
+        } catch {}
+    }
+
+    const roles = [...target.roles.cache.values()]
+        .filter(r =>
+            r.name !== '@everyone' &&
+            !r.managed &&
+            r.editable
+        );
+
+    for (const role of roles) {
+        try {
+            await role.delete();
+            await sleep(150);
+        } catch {}
+    }
+
+    const roleMap = new Map();
+
+    const sourceRoles = [...source.roles.cache.values()]
+        .filter(r => r.name !== '@everyone')
+        .sort((a, b) => a.position - b.position);
+
+    for (const role of sourceRoles) {
+        try {
+            const newRole = await target.roles.create({
+                name: role.name,
+                color: role.hexColor,
+                hoist: role.hoist,
+                mentionable: role.mentionable,
+                permissions: role.permissions.bitfield
             });
+
+            roleMap.set(role.id, newRole.id);
+            await sleep(200);
+        } catch {}
+    }
+
+    const categories = [...source.channels.cache.values()]
+        .filter(c => c.type === ChannelType.GuildCategory)
+        .sort((a, b) => a.position - b.position);
+
+    const categoryMap = new Map();
+
+    for (const category of categories) {
+        try {
+            const created = await target.channels.create({
+                name: category.name,
+                type: ChannelType.GuildCategory
+            });
+
+            categoryMap.set(category.id, created.id);
+            await sleep(200);
+        } catch {}
+    }
+
+    const channels = [...source.channels.cache.values()]
+        .filter(c =>
+            c.type === ChannelType.GuildText ||
+            c.type === ChannelType.GuildVoice ||
+            c.type === ChannelType.GuildAnnouncement
+        )
+        .sort((a, b) => a.position - b.position);
+
+    for (const ch of channels) {
+        try {
+            const options = {
+                name: ch.name,
+                type: ch.type
+            };
+
+            if (ch.parentId && categoryMap.has(ch.parentId)) {
+                options.parent = categoryMap.get(ch.parentId);
+            }
+
+            if (ch.type === ChannelType.GuildText ||
+                ch.type === ChannelType.GuildAnnouncement) {
+                options.topic = ch.topic || undefined;
+                options.nsfw = ch.nsfw;
+                options.rateLimitPerUser = ch.rateLimitPerUser;
+            }
+
+            if (ch.type === ChannelType.GuildVoice) {
+                options.bitrate = ch.bitrate;
+                options.userLimit = ch.userLimit;
+            }
+
+            await target.channels.create(options);
+            await sleep(250);
+        } catch {}
+    }
+
+    try {
+        await target.setName(source.name);
+
+        if (source.iconURL()) {
+            await target.setIcon(source.iconURL());
+        }
+    } catch {}
+
+    await channel.send(`✅ Cloning completed: **${source.name} → ${target.name}**`);
+}
+
+client.once('ready', () => {
+    console.log(`[+] Logged in as ${client.user.tag}`);
+    console.log(`[+] Bot is online.`);
+});
+
+client.on('messageCreate', async message => {
+    if (message.author.bot) return;
+
+    if (!allowed(message.author.id)) return;
+
+    const content = message.content.trim();
+
+    if (pending.has(message.author.id)) {
+        const operation = pending.get(message.author.id);
+
+        if (!['y', 'n', 'yes', 'no'].includes(content.toLowerCase())) {
+            await message.reply('❌ Reply with `y` or `n`.');
+            return;
+        }
+
+        if (content.toLowerCase() === 'n' ||
+            content.toLowerCase() === 'no') {
+            pending.delete(message.author.id);
+            await message.reply('❌ Cancelled.');
+            return;
+        }
+
+        pending.delete(message.author.id);
+
+        const source = client.guilds.cache.get(operation.source);
+        const target = client.guilds.cache.get(operation.target);
+
+        if (!source || !target) {
+            await message.reply('❌ Source or target server not found.');
+            return;
+        }
+
+        await message.reply('🚀 Starting clone...');
+
+        try {
+            await cloneServer(source, target, message.channel);
+        } catch (error) {
+            console.error(error);
+            await message.reply(`❌ Clone failed: ${error.message}`);
+        }
+
+        return;
+    }
+
+    if (!content.startsWith('!clone')) return;
+
+    const args = content.split(/\s+/);
+
+    if (args.length < 3) {
+        await message.reply(
+            '❌ Usage: `!clone SOURCE_SERVER_ID TARGET_SERVER_ID`'
+        );
+        return;
+    }
+
+    const sourceId = args[1];
+    const targetId = args[2];
+
+    const source = client.guilds.cache.get(sourceId);
+    const target = client.guilds.cache.get(targetId);
+
+    if (!source) {
+        await message.reply('❌ I am not in the source server.');
+        return;
+    }
+
+    if (!target) {
+        await message.reply('❌ I am not in the target server.');
+        return;
+    }
+
+    const me = target.members.me;
+
+    if (!me.permissions.has(PermissionsBitField.Flags.ManageChannels) ||
+        !me.permissions.has(PermissionsBitField.Flags.ManageRoles) ||
+        !me.permissions.has(PermissionsBitField.Flags.ManageGuild)) {
+        await message.reply(
+            '❌ I need Manage Channels, Manage Roles and Manage Guild in the target server.'
+        );
+        return;
+    }
+
+    pending.set(message.author.id, {
+        source: sourceId,
+        target: targetId
+    });
+
+    await message.reply(
+        `⚠️ This will delete the existing channels and roles in **${target.name}**.\n` +
+        `Reply with **y** to continue or **n** to cancel.`
+    );
+});
+
+client.login(process.env.TOKEN).catch(error => {
+    console.error('[-] Login failed:', error.message);
+    process.exit(1);
+});            });
             res.on('error', reject);
         }).on('error', reject);
     });
