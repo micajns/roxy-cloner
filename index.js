@@ -3,9 +3,7 @@ require("dotenv").config();
 const {
     Client,
     GatewayIntentBits,
-    ChannelType,
-    PermissionsBitField,
-    Collection
+    ChannelType
 } = require("discord.js");
 
 const client = new Client({
@@ -17,79 +15,68 @@ const client = new Client({
 });
 
 const PREFIX = "!";
+const TOKEN = process.env.TOKEN;
+
 const ALLOWED_USER_IDS = (process.env.ALLOWED_USER_IDS || "")
     .split(",")
     .map(id => id.trim())
-    .filter(Boolean);
-
-const pendingConfirmations = new Collection();
+    .filter(id => id.length > 0);
 
 function isAllowed(userId) {
     return ALLOWED_USER_IDS.includes(userId);
 }
 
 function log(message) {
-    console.log(`[ServerCloner] ${message}`);
+    console.log("[ServerCloner] " + message);
 }
 
-function errorLog(message, error) {
-    console.error(`[ServerCloner] ${message}`, error || "");
-}
+async function deleteTargetChannels(guild) {
+    const channelsToDelete = [...guild.channels.cache.values()];
 
-async function safeDeleteChannel(channel) {
-    try {
-        await channel.delete();
-        return true;
-    } catch (error) {
-        errorLog(`Failed to delete channel ${channel.name}`, error.message);
-        return false;
+    for (const channel of channelsToDelete) {
+        try {
+            await channel.delete("Server clone");
+            log("Deleted channel: " + channel.name);
+        } catch (error) {
+            console.error(
+                "Failed to delete channel " +
+                channel.name +
+                ": " +
+                error.message
+            );
+        }
     }
 }
 
-async function safeDeleteRole(role) {
-    try {
-        if (role.managed) return false;
-        if (role.id === role.guild.id) return false;
+async function deleteTargetRoles(guild) {
+    const rolesToDelete = [...guild.roles.cache.values()]
+        .filter(role => !role.managed && role.id !== guild.id);
 
-        await role.delete();
-        return true;
-    } catch (error) {
-        errorLog(`Failed to delete role ${role.name}`, error.message);
-        return false;
+    for (const role of rolesToDelete) {
+        try {
+            await role.delete("Server clone");
+            log("Deleted role: " + role.name);
+        } catch (error) {
+            console.error(
+                "Failed to delete role " +
+                role.name +
+                ": " +
+                error.message
+            );
+        }
     }
 }
 
-async function clearTargetServer(targetGuild) {
-    log(`Clearing target server: ${targetGuild.name}`);
-
-    const existingChannels = [...targetGuild.channels.cache.values()];
-
-    for (const channel of existingChannels) {
-        await safeDeleteChannel(channel);
-    }
-
-    const existingRoles = [...targetGuild.roles.cache.values()]
-        .filter(role => !role.managed && role.id !== targetGuild.id);
-
-    for (const role of existingRoles) {
-        await safeDeleteRole(role);
-    }
-
-    log("Target server cleared.");
-}
-
-async function cloneRoles(sourceGuild, targetGuild) {
-    log("Cloning roles...");
-
+async function cloneRoles(source, target) {
     const roleMap = new Map();
 
-    const sourceRoles = [...sourceGuild.roles.cache.values()]
-        .filter(role => !role.managed && role.id !== sourceGuild.id)
+    const sourceRoles = [...source.roles.cache.values()]
+        .filter(role => !role.managed && role.id !== source.id)
         .sort((a, b) => a.position - b.position);
 
     for (const sourceRole of sourceRoles) {
         try {
-            const newRole = await targetGuild.roles.create({
+            const newRole = await target.roles.create({
                 name: sourceRole.name,
                 color: sourceRole.color,
                 hoist: sourceRole.hoist,
@@ -100,10 +87,12 @@ async function cloneRoles(sourceGuild, targetGuild) {
 
             roleMap.set(sourceRole.id, newRole.id);
 
-            log(`Created role: ${sourceRole.name}`);
+            log("Created role: " + sourceRole.name);
         } catch (error) {
-            errorLog(
-                `Failed to create role "${sourceRole.name}"`,
+            console.error(
+                "Failed to create role " +
+                sourceRole.name +
+                ": " +
                 error.message
             );
         }
@@ -112,29 +101,29 @@ async function cloneRoles(sourceGuild, targetGuild) {
     return roleMap;
 }
 
-async function cloneCategories(sourceGuild, targetGuild) {
-    log("Cloning categories...");
-
+async function cloneCategories(source, target) {
     const categoryMap = new Map();
 
-    const sourceCategories = [...sourceGuild.channels.cache.values()]
+    const sourceCategories = [...source.channels.cache.values()]
         .filter(channel => channel.type === ChannelType.GuildCategory)
         .sort((a, b) => a.position - b.position);
 
-    for (const sourceCategory of sourceCategories) {
+    for (const category of sourceCategories) {
         try {
-            const newCategory = await targetGuild.channels.create({
-                name: sourceCategory.name,
+            const newCategory = await target.channels.create({
+                name: category.name,
                 type: ChannelType.GuildCategory,
                 reason: "Server clone"
             });
 
-            categoryMap.set(sourceCategory.id, newCategory.id);
+            categoryMap.set(category.id, newCategory.id);
 
-            log(`Created category: ${sourceCategory.name}`);
+            log("Created category: " + category.name);
         } catch (error) {
-            errorLog(
-                `Failed to create category "${sourceCategory.name}"`,
+            console.error(
+                "Failed to create category " +
+                category.name +
+                ": " +
                 error.message
             );
         }
@@ -143,40 +132,44 @@ async function cloneCategories(sourceGuild, targetGuild) {
     return categoryMap;
 }
 
-function getChannelType(channel) {
-    switch (channel.type) {
-        case ChannelType.GuildText:
-            return ChannelType.GuildText;
-
-        case ChannelType.GuildVoice:
-            return ChannelType.GuildVoice;
-
-        case ChannelType.GuildAnnouncement:
-            return ChannelType.GuildAnnouncement;
-
-        case ChannelType.GuildStageVoice:
-            return ChannelType.GuildStageVoice;
-
-        case ChannelType.GuildForum:
-            return ChannelType.GuildForum;
-
-        default:
-            return null;
+function getSupportedChannelType(channel) {
+    if (channel.type === ChannelType.GuildText) {
+        return ChannelType.GuildText;
     }
+
+    if (channel.type === ChannelType.GuildVoice) {
+        return ChannelType.GuildVoice;
+    }
+
+    if (channel.type === ChannelType.GuildAnnouncement) {
+        return ChannelType.GuildAnnouncement;
+    }
+
+    if (channel.type === ChannelType.GuildStageVoice) {
+        return ChannelType.GuildStageVoice;
+    }
+
+    if (channel.type === ChannelType.GuildForum) {
+        return ChannelType.GuildForum;
+    }
+
+    return null;
 }
 
-async function cloneChannels(sourceGuild, targetGuild, categoryMap) {
-    log("Cloning channels...");
-
-    const sourceChannels = [...sourceGuild.channels.cache.values()]
+async function cloneChannels(source, target, categoryMap) {
+    const sourceChannels = [...source.channels.cache.values()]
         .filter(channel => channel.type !== ChannelType.GuildCategory)
         .sort((a, b) => a.position - b.position);
 
     for (const sourceChannel of sourceChannels) {
-        const channelType = getChannelType(sourceChannel);
+        const channelType = getSupportedChannelType(sourceChannel);
 
         if (!channelType) {
-            log(`Skipping unsupported channel: ${sourceChannel.name}`);
+            log(
+                "Skipped unsupported channel: " +
+                sourceChannel.name
+            );
+
             continue;
         }
 
@@ -188,11 +181,12 @@ async function cloneChannels(sourceGuild, targetGuild, categoryMap) {
             };
 
             if (sourceChannel.parentId) {
-                const targetCategoryId =
-                    categoryMap.get(sourceChannel.parentId);
+                const categoryId = categoryMap.get(
+                    sourceChannel.parentId
+                );
 
-                if (targetCategoryId) {
-                    options.parent = targetCategoryId;
+                if (categoryId) {
+                    options.parent = categoryId;
                 }
             }
 
@@ -200,396 +194,416 @@ async function cloneChannels(sourceGuild, targetGuild, categoryMap) {
                 channelType === ChannelType.GuildText ||
                 channelType === ChannelType.GuildAnnouncement
             ) {
+                options.nsfw = sourceChannel.nsfw || false;
+
                 if (sourceChannel.topic) {
                     options.topic = sourceChannel.topic;
                 }
 
-                options.nsfw = sourceChannel.nsfw;
-                options.rateLimitPerUser =
-                    sourceChannel.rateLimitPerUser;
+                if (sourceChannel.rateLimitPerUser) {
+                    options.rateLimitPerUser =
+                        sourceChannel.rateLimitPerUser;
+                }
             }
 
             if (
                 channelType === ChannelType.GuildVoice ||
                 channelType === ChannelType.GuildStageVoice
             ) {
-                options.bitrate = sourceChannel.bitrate;
-                options.userLimit = sourceChannel.userLimit;
+                if (sourceChannel.bitrate) {
+                    options.bitrate = sourceChannel.bitrate;
+                }
 
-                if (sourceChannel.rtcRegion) {
-                    options.rtcRegion = sourceChannel.rtcRegion;
+                if (sourceChannel.userLimit) {
+                    options.userLimit = sourceChannel.userLimit;
                 }
             }
 
-            const newChannel = await targetGuild.channels.create(options);
+            await target.channels.create(options);
 
-            log(`Created channel: ${sourceChannel.name}`);
-
-            if (sourceChannel.permissionOverwrites?.cache?.size) {
-                for (const overwrite of sourceChannel.permissionOverwrites.cache.values()) {
-                    try {
-                        if (overwrite.id === sourceGuild.id) {
-                            await newChannel.permissionOverwrites.edit(
-                                targetGuild.roles.everyone,
-                                overwrite.allow.bitfield,
-                                {
-                                    deny: overwrite.deny.bitfield,
-                                    reason: "Server clone"
-                                }
-                            );
-
-                            continue;
-                        }
-
-                        const mappedRoleId = null;
-
-                        if (!mappedRoleId) {
-                            continue;
-                        }
-
-                        await newChannel.permissionOverwrites.edit(
-                            mappedRoleId,
-                            {
-                                allow: overwrite.allow.bitfield,
-                                deny: overwrite.deny.bitfield
-                            },
-                            {
-                                reason: "Server clone"
-                            }
-                        );
-                    } catch (error) {
-                        errorLog(
-                            `Failed to clone permissions for ${sourceChannel.name}`,
-                            error.message
-                        );
-                    }
-                }
-            }
+            log("Created channel: " + sourceChannel.name);
         } catch (error) {
-            errorLog(
-                `Failed to create channel "${sourceChannel.name}"`,
+            console.error(
+                "Failed to create channel " +
+                sourceChannel.name +
+                ": " +
                 error.message
             );
         }
     }
 }
 
-async function cloneEmojis(sourceGuild, targetGuild) {
-    log("Cloning emojis...");
+async function cloneEmojis(source, target) {
+    const sourceEmojis = [...source.emojis.cache.values()];
 
-    if (!sourceGuild.emojis?.cache?.size) {
+    if (sourceEmojis.length === 0) {
         log("No emojis found.");
         return;
     }
 
-    for (const emoji of sourceGuild.emojis.cache.values()) {
+    for (const emoji of sourceEmojis) {
         try {
-            if (!emoji.url) continue;
+            if (!emoji.url) {
+                continue;
+            }
 
-            await targetGuild.emojis.create({
+            await target.emojis.create({
                 attachment: emoji.url,
                 name: emoji.name,
                 reason: "Server clone"
             });
 
-            log(`Created emoji: ${emoji.name}`);
+            log("Created emoji: " + emoji.name);
         } catch (error) {
-            errorLog(
-                `Failed to create emoji "${emoji.name}"`,
+            console.error(
+                "Failed to create emoji " +
+                emoji.name +
+                ": " +
                 error.message
             );
         }
     }
 }
 
-async function cloneServer(sourceGuild, targetGuild) {
-    log("----------------------------------------");
-    log(`Starting clone`);
-    log(`Source: ${sourceGuild.name}`);
-    log(`Target: ${targetGuild.name}`);
-    log("----------------------------------------");
+async function cloneServer(source, target) {
+    log("========================================");
+    log("Starting server clone");
+    log("Source: " + source.name);
+    log("Target: " + target.name);
+    log("========================================");
 
-    await sourceGuild.channels.fetch();
-    await targetGuild.channels.fetch();
+    await source.channels.fetch();
+    await target.channels.fetch();
 
-    await sourceGuild.roles.fetch();
-    await targetGuild.roles.fetch();
+    await source.roles.fetch();
+    await target.roles.fetch();
 
-    log("Step 1/5: Clearing target server...");
-    await clearTargetServer(targetGuild);
+    log("Step 1/5 - Clearing target channels...");
+    await deleteTargetChannels(target);
 
-    log("Step 2/5: Cloning roles...");
-    const roleMap = await cloneRoles(sourceGuild, targetGuild);
+    log("Step 2/5 - Clearing target roles...");
+    await deleteTargetRoles(target);
 
-    log("Step 3/5: Cloning categories...");
-    const categoryMap = await cloneCategories(
-        sourceGuild,
-        targetGuild
-    );
+    log("Step 3/5 - Cloning roles...");
+    const roleMap = await cloneRoles(source, target);
 
-    log("Step 4/5: Cloning channels...");
+    log("Step 4/5 - Cloning categories and channels...");
+    const categoryMap = await cloneCategories(source, target);
+
     await cloneChannels(
-        sourceGuild,
-        targetGuild,
+        source,
+        target,
         categoryMap,
         roleMap
     );
 
-    log("Step 5/5: Cloning emojis...");
-    await cloneEmojis(sourceGuild, targetGuild);
+    log("Step 5/5 - Cloning emojis...");
+    await cloneEmojis(source, target);
 
-    log("----------------------------------------");
-    log("Clone completed successfully.");
-    log("----------------------------------------");
+    log("========================================");
+    log("Server clone completed");
+    log("========================================");
 }
 
-async function getGuild(guildId) {
-    try {
-        return await client.guilds.fetch(guildId);
-    } catch (error) {
-        return null;
-    }
-}
-
-client.once("ready", async () => {
-    log(`Logged in as ${client.user.tag}`);
-    log(`Bot ID: ${client.user.id}`);
-    log(`Connected to ${client.guilds.cache.size} guild(s)`);
-    log("Bot is ready.");
-    log("Listening for clone commands.");
-});
-
-client.on("guildCreate", guild => {
-    log(`Joined guild: ${guild.name} (${guild.id})`);
-});
-
-client.on("guildDelete", guild => {
-    log(`Left guild: ${guild.name} (${guild.id})`);
+client.once("ready", () => {
+    console.log("");
+    console.log("========================================");
+    console.log("       DISCORD SERVER CLONER");
+    console.log("========================================");
+    console.log("");
+    console.log("Logged in as: " + client.user.tag);
+    console.log("Bot ID: " + client.user.id);
+    console.log(
+        "Connected servers: " +
+        client.guilds.cache.size
+    );
+    console.log("");
+    console.log("Bot is ready.");
+    console.log("Listening for clone commands.");
+    console.log("");
 });
 
 client.on("messageCreate", async message => {
-    try {
-        if (message.author.bot) return;
+    if (message.author.bot) {
+        return;
+    }
 
-        if (!message.content.startsWith(PREFIX)) return;
+    if (!message.content.startsWith(PREFIX)) {
+        return;
+    }
 
-        const args = message.content.trim().split(/\s+/);
-        const command = args[0].slice(PREFIX.length).toLowerCase();
+    const args = message.content
+        .trim()
+        .split(/\s+/);
 
-        if (command === "help") {
-            await message.reply(
-                [
-                    "**Server Cloner**",
-                    "",
-                    "`!clone <sourceGuildId> <targetGuildId>`",
-                    "Clone a server into another server.",
-                    "",
-                    "`!status`",
-                    "Show bot status.",
-                    "",
-                    "`!guilds`",
-                    "Show the servers the bot can access."
-                ].join("\n")
-            );
+    const command = args[0]
+        .slice(PREFIX.length)
+        .toLowerCase();
 
-            return;
-        }
-
-        if (command === "status") {
-            await message.reply(
-                `🟢 Online\nServers: **${client.guilds.cache.size}**`
-            );
-
-            return;
-        }
-
-        if (command === "guilds") {
-            if (!isAllowed(message.author.id)) {
-                await message.reply("You are not authorized to use this command.");
-                return;
-            }
-
-            const guilds = [...client.guilds.cache.values()];
-
-            if (!guilds.length) {
-                await message.reply("The bot is not connected to any servers.");
-                return;
-            }
-
-            const text = guilds
-                .map(guild => `• ${guild.name} — \`${guild.id}\``)
-                .join("\n");
-
-            await message.reply(`**Connected Servers**\n${text}`);
-
-            return;
-        }
-
-        if (command !== "clone") return;
-
-        if (!isAllowed(message.author.id)) {
-            await message.reply(
-                "❌ You are not authorized to use the clone command."
-            );
-
-            return;
-        }
-
-        if (args.length < 3) {
-            await message.reply(
-                "Usage: `!clone <sourceGuildId> <targetGuildId>`"
-            );
-
-            return;
-        }
-
-        const sourceId = args[1];
-        const targetId = args[2];
-
-        if (!/^\d{17,20}$/.test(sourceId)) {
-            await message.reply("❌ Invalid source server ID.");
-            return;
-        }
-
-        if (!/^\d{17,20}$/.test(targetId)) {
-            await message.reply("❌ Invalid target server ID.");
-            return;
-        }
-
-        if (sourceId === targetId) {
-            await message.reply(
-                "❌ The source and target servers must be different."
-            );
-
-            return;
-        }
-
-        const sourceGuild = await getGuild(sourceId);
-        const targetGuild = await getGuild(targetId);
-
-        if (!sourceGuild) {
-            await message.reply(
-                "❌ I cannot access the source server."
-            );
-
-            return;
-        }
-
-        if (!targetGuild) {
-            await message.reply(
-                "❌ I cannot access the target server."
-            );
-
-            return;
-        }
-
-        const confirmationId =
-            `${message.author.id}:${sourceId}:${targetId}`;
-
-        pendingConfirmations.set(confirmationId, {
-            userId: message.author.id,
-            sourceId,
-            targetId,
-            createdAt: Date.now()
-        });
-
+    if (command === "help") {
         await message.reply(
             [
-                "⚠️ **Clone Confirmation**",
+                "**Discord Server Cloner**",
                 "",
-                `Source: **${sourceGuild.name}**`,
-                `Target: **${targetGuild.name}**`,
+                "`!clone <source ID> <target ID>`",
+                "Clone the structure of one server into another.",
                 "",
-                "This will modify the target server.",
+                "`!guilds`",
+                "Show servers accessible by the bot.",
                 "",
-                "Reply with `yes` to continue.",
-                "Reply with `no` to cancel.",
-                "You have 30 seconds."
+                "`!status`",
+                "Show bot status."
             ].join("\n")
         );
 
-        const filter = response => {
-            return (
-                response.author.id === message.author.id &&
-                ["yes", "no"].includes(
-                    response.content.toLowerCase()
-                )
-            );
-        };
+        return;
+    }
 
-        const collected = await message.channel.awaitMessages({
+    if (command === "status") {
+        await message.reply(
+            "🟢 Bot online\n" +
+            "Connected servers: " +
+            client.guilds.cache.size
+        );
+
+        return;
+    }
+
+    if (command === "guilds") {
+        if (!isAllowed(message.author.id)) {
+            await message.reply(
+                "❌ You are not authorized to use this command."
+            );
+
+            return;
+        }
+
+        const guildList = [...client.guilds.cache.values()]
+            .map(
+                guild =>
+                    "• " +
+                    guild.name +
+                    " — `" +
+                    guild.id +
+                    "`"
+            )
+            .join("\n");
+
+        if (!guildList) {
+            await message.reply(
+                "The bot is not connected to any servers."
+            );
+
+            return;
+        }
+
+        await message.reply(
+            "**Connected Servers**\n" +
+            guildList
+        );
+
+        return;
+    }
+
+    if (command !== "clone") {
+        return;
+    }
+
+    if (!isAllowed(message.author.id)) {
+        await message.reply(
+            "❌ You are not authorized to use this command."
+        );
+
+        return;
+    }
+
+    if (args.length < 3) {
+        await message.reply(
+            "Usage:\n" +
+            "`!clone <sourceGuildId> <targetGuildId>`"
+        );
+
+        return;
+    }
+
+    const sourceId = args[1];
+    const targetId = args[2];
+
+    if (!/^\d{17,20}$/.test(sourceId)) {
+        await message.reply(
+            "❌ Invalid source server ID."
+        );
+
+        return;
+    }
+
+    if (!/^\d{17,20}$/.test(targetId)) {
+        await message.reply(
+            "❌ Invalid target server ID."
+        );
+
+        return;
+    }
+
+    if (sourceId === targetId) {
+        await message.reply(
+            "❌ Source and target servers cannot be the same."
+        );
+
+        return;
+    }
+
+    let source;
+    let target;
+
+    try {
+        source = await client.guilds.fetch(sourceId);
+    } catch (error) {
+        await message.reply(
+            "❌ I cannot access the source server."
+        );
+
+        return;
+    }
+
+    try {
+        target = await client.guilds.fetch(targetId);
+    } catch (error) {
+        await message.reply(
+            "❌ I cannot access the target server."
+        );
+
+        return;
+    }
+
+    await message.reply(
+        [
+            "⚠️ **Clone Confirmation**",
+            "",
+            "**Source:** " + source.name,
+            "**Target:** " + target.name,
+            "",
+            "This will modify the target server.",
+            "",
+            "Type `yes` to continue.",
+            "Type `no` to cancel.",
+            "",
+            "You have 30 seconds."
+        ].join("\n")
+    );
+
+    const filter = response => {
+        return (
+            response.author.id === message.author.id &&
+            (
+                response.content.toLowerCase() === "yes" ||
+                response.content.toLowerCase() === "no"
+            )
+        );
+    };
+
+    let collected;
+
+    try {
+        collected = await message.channel.awaitMessages({
             filter,
             max: 1,
             time: 30000
         });
-
-        pendingConfirmations.delete(confirmationId);
-
-        if (!collected.size) {
-            await message.channel.send(
-                "⌛ Clone cancelled because no confirmation was received."
-            );
-
-            return;
-        }
-
-        const response = collected.first();
-
-        if (response.content.toLowerCase() === "no") {
-            await message.channel.send(
-                "❌ Clone cancelled."
-            );
-
-            return;
-        }
-
+    } catch (error) {
         await message.channel.send(
-            "🚀 Clone started. Check the bot console for progress."
+            "❌ Failed to receive confirmation."
         );
 
-        try {
-            await cloneServer(sourceGuild, targetGuild);
+        return;
+    }
 
-            await message.channel.send(
-                `✅ **Clone completed**\n${sourceGuild.name} → ${targetGuild.name}`
-            );
-        } catch (error) {
-            errorLog("Clone failed.", error);
+    if (collected.size === 0) {
+        await message.channel.send(
+            "⌛ Clone cancelled. No confirmation received."
+        );
 
-            await message.channel.send(
-                `❌ **Clone failed:** \`${error.message}\``
-            );
-        }
+        return;
+    }
+
+    const confirmation =
+        collected.first().content.toLowerCase();
+
+    if (confirmation === "no") {
+        await message.channel.send(
+            "❌ Clone cancelled."
+        );
+
+        return;
+    }
+
+    await message.channel.send(
+        "🚀 **Clone started.**\n" +
+        "The bot is now cloning the server."
+    );
+
+    try {
+        await cloneServer(source, target);
+
+        await message.channel.send(
+            "✅ **Clone completed successfully.**\n" +
+            source.name +
+            " → " +
+            target.name
+        );
     } catch (error) {
-        errorLog("Command error.", error);
+        console.error(
+            "Clone failed:",
+            error
+        );
 
-        try {
-            await message.reply(
-                `❌ Error: \`${error.message}\``
-            );
-        } catch {}
+        await message.channel.send(
+            "❌ **Clone failed:** `" +
+            error.message +
+            "`"
+        );
     }
 });
 
+client.on("error", error => {
+    console.error(
+        "Discord client error:",
+        error
+    );
+});
+
 process.on("unhandledRejection", error => {
-    errorLog("Unhandled promise rejection.", error);
+    console.error(
+        "Unhandled promise rejection:",
+        error
+    );
 });
 
 process.on("uncaughtException", error => {
-    errorLog("Uncaught exception.", error);
+    console.error(
+        "Uncaught exception:",
+        error
+    );
 });
 
-if (!process.env.TOKEN) {
-    console.error("ERROR: TOKEN environment variable is missing.");
+if (!TOKEN) {
+    console.error(
+        "ERROR: The TOKEN environment variable is missing."
+    );
+
     process.exit(1);
 }
 
-client.login(process.env.TOKEN)
+client.login(TOKEN)
     .then(() => {
-        log("Login request completed.");
+        console.log("Discord login successful.");
     })
     .catch(error => {
-        console.error("ERROR: Discord login failed.");
+        console.error(
+            "Discord login failed:"
+        );
+
         console.error(error);
+
         process.exit(1);
     });
