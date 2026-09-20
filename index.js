@@ -23,7 +23,9 @@ const allowedUsers = (process.env.ALLOWED_USER_IDS || '')
 
 const pending = new Map();
 
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 function allowed(id) {
     return allowedUsers.includes(id);
