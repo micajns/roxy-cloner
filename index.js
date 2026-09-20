@@ -95,7 +95,7 @@ async function cloneServer(source, target, channel) {
         } catch {}
     }
 
-    const channels = [...source.channels.cache.values()]
+    const sourceChannels = [...source.channels.cache.values()]
         .filter(c =>
             c.type === ChannelType.GuildText ||
             c.type === ChannelType.GuildVoice ||
